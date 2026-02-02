@@ -175,9 +175,11 @@ export function getHtmlPage(sessionId: string, port: number): string {
 
   <div id="editor-container">
     <strudel-editor id="strudel-repl">
+<!--
 // Welcome to Claude DJ Radio!
 // Click "Start Audio" above, then the DJ will take over.
 s("bd sd:1 hh sd:2").gain(0.8)
+-->
     </strudel-editor>
   </div>
 
@@ -205,6 +207,14 @@ s("bd sd:1 hh sd:2").gain(0.8)
     let audioStarted = false;
     let connected = false;
     let pollTimer = null;
+    let editorReady = false;
+
+    // Track state from the strudel-editor 'update' event
+    let strudelState = {
+      started: false,
+      activeCode: '',
+      error: null,
+    };
 
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
@@ -216,10 +226,47 @@ s("bd sd:1 hh sd:2").gain(0.8)
     const footerConnection = document.getElementById('footer-connection');
     const toast = document.getElementById('request-toast');
 
-    function getEditor() {
+    // Get the StrudelMirror instance from the <strudel-editor> element.
+    // The web component creates .editor (StrudelMirror) in connectedCallback
+    // via setTimeout, so it may be null initially.
+    function getStrudelMirror() {
       const el = document.getElementById('strudel-repl');
-      return el ? el : null;
+      return el && el.editor ? el.editor : null;
     }
+
+    // Wait for the editor to become available
+    function waitForEditor() {
+      return new Promise((resolve) => {
+        const check = () => {
+          const mirror = getStrudelMirror();
+          if (mirror) {
+            editorReady = true;
+            resolve(mirror);
+          } else {
+            setTimeout(check, 100);
+          }
+        };
+        check();
+      });
+    }
+
+    // Listen for state updates from the <strudel-editor> custom event
+    const replEl = document.getElementById('strudel-repl');
+    replEl.addEventListener('update', (e) => {
+      const detail = e.detail || {};
+      strudelState.started = !!detail.started;
+      strudelState.activeCode = detail.activeCode || '';
+      strudelState.error = detail.error ? (detail.error.message || String(detail.error)) : null;
+
+      // Update UI based on strudel state
+      if (strudelState.started) {
+        audioStarted = true;
+        updateStatus('playing', 'Playing');
+        footerState.textContent = 'Playing';
+        startBtn.textContent = 'Audio Started';
+        startBtn.disabled = true;
+      }
+    });
 
     function updateStatus(state, text) {
       statusDot.className = 'dot ' + state;
@@ -231,17 +278,14 @@ s("bd sd:1 hh sd:2").gain(0.8)
       startBtn.disabled = true;
       startBtn.textContent = 'Starting...';
       try {
-        const editor = getEditor();
-        if (editor) {
-          // Evaluate the current code to start Web Audio context
-          await editor.evaluate();
-          audioStarted = true;
-          updateStatus('playing', 'Playing');
-          footerState.textContent = 'Playing';
-          startBtn.textContent = 'Audio Started';
-          // Report state immediately
-          reportState();
-        }
+        const mirror = await waitForEditor();
+        // evaluate() triggers audio context init via user gesture
+        await mirror.evaluate(true);
+        audioStarted = true;
+        updateStatus('playing', 'Playing');
+        footerState.textContent = 'Playing';
+        startBtn.textContent = 'Audio Started';
+        reportState();
       } catch (e) {
         console.error('Failed to start audio:', e);
         startBtn.disabled = false;
@@ -274,21 +318,14 @@ s("bd sd:1 hh sd:2").gain(0.8)
     // Report browser state to server
     async function reportState() {
       try {
-        const editor = getEditor();
+        const mirror = getStrudelMirror();
         let cps = 0.5;
-        let activeCode = '';
-        let error = null;
 
-        if (editor) {
+        if (mirror) {
           try {
-            // Try to read CPS from the editor/repl
-            if (editor.repl && editor.repl.scheduler) {
-              cps = editor.repl.scheduler.cps || 0.5;
+            if (mirror.repl && mirror.repl.scheduler) {
+              cps = mirror.repl.scheduler.cps || 0.5;
             }
-          } catch (e) { /* ignore */ }
-
-          try {
-            activeCode = editor.getCode ? editor.getCode() : '';
           } catch (e) { /* ignore */ }
         }
 
@@ -297,9 +334,9 @@ s("bd sd:1 hh sd:2").gain(0.8)
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             sessionId: SESSION_ID,
-            started: audioStarted,
-            activeCode,
-            error,
+            started: strudelState.started || audioStarted,
+            activeCode: strudelState.activeCode || (mirror ? mirror.code : ''),
+            error: strudelState.error,
             cps
           })
         });
@@ -327,12 +364,14 @@ s("bd sd:1 hh sd:2").gain(0.8)
         // Check for new version with pending action
         if (data.version > lastVersion && data.action) {
           lastVersion = data.version;
-          const editor = getEditor();
+          const mirror = getStrudelMirror();
 
-          if (data.action === 'evaluate' && data.code && editor) {
+          if (!mirror) {
+            console.warn('Editor not ready yet, skipping action');
+          } else if (data.action === 'evaluate' && data.code) {
             try {
-              editor.setCode(data.code);
-              await editor.evaluate();
+              mirror.setCode(data.code);
+              await mirror.evaluate(true);
               audioStarted = true;
               updateStatus('playing', 'Playing');
               footerState.textContent = 'Playing';
@@ -341,22 +380,12 @@ s("bd sd:1 hh sd:2").gain(0.8)
             } catch (e) {
               console.error('Evaluate error:', e);
               updateStatus('error', 'Error: ' + (e.message || e));
-              // Report error state
-              await fetch(BASE_URL + '/api/state', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  sessionId: SESSION_ID,
-                  started: audioStarted,
-                  activeCode: data.code,
-                  error: e.message || String(e),
-                  cps: 0.5
-                })
-              });
+              strudelState.error = e.message || String(e);
             }
-          } else if (data.action === 'stop' && editor) {
+          } else if (data.action === 'stop') {
             try {
-              editor.stop();
+              await mirror.stop();
+              strudelState.started = false;
               updateStatus('connected', 'Stopped');
               footerState.textContent = 'Stopped';
             } catch (e) {
@@ -365,9 +394,11 @@ s("bd sd:1 hh sd:2").gain(0.8)
           }
         }
 
-        // Update BPM display
-        if (data.cps) {
-          const bpm = Math.round(data.cps * 60 * 4);
+        // Update BPM display from mirror scheduler
+        const mirror = getStrudelMirror();
+        if (mirror && mirror.repl && mirror.repl.scheduler) {
+          const cps = mirror.repl.scheduler.cps || 0.5;
+          const bpm = Math.round(cps * 60 * 4);
           footerBpm.textContent = 'BPM: ' + bpm;
         }
 
@@ -385,7 +416,7 @@ s("bd sd:1 hh sd:2").gain(0.8)
 
     // Start polling
     pollTimer = setInterval(poll, POLL_INTERVAL);
-    poll(); // Initial poll
+    poll();
   </script>
 </body>
 </html>`;
