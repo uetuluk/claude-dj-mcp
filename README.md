@@ -10,6 +10,25 @@ An MCP server that lets Claude act as an autonomous radio DJ using [Strudel](htt
 - 📻 **Audience requests** — Take song/vibe requests from browser UI
 - 🔄 **Autonomous DJ loop** — Play → announce → wait → adapt → repeat
 
+## Security Notice
+
+⚠️ **This project is designed for local development and personal use only.**
+
+**Important security considerations:**
+
+- **Local use only** — The HTTP server binds to localhost but has open CORS headers (`Access-Control-Allow-Origin: *`)
+- **Code execution** — Claude sends arbitrary Strudel code that is evaluated in the browser without sandboxing
+- **Command execution** — The `dj_speak` tool executes shell commands (macOS `say`) with user-controlled input
+- **No authentication** — Anyone with access to localhost can interact with active sessions
+- **No rate limiting** — Request queue and endpoints are not protected against abuse
+
+**Recommendations:**
+
+- Only run on trusted machines with trusted Claude instances
+- Do not expose the HTTP server to network interfaces beyond localhost
+- Do not run in multi-user environments without additional security hardening
+- Review the code before use if you have security concerns
+
 ## Architecture
 
 ```
