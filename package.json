@@ -2,6 +2,7 @@
   "name": "claude-dj-mcp",
   "version": "0.1.0",
   "description": "MCP server that lets Claude act as an autonomous radio DJ using Strudel",
+  "license": "AGPL-3.0",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

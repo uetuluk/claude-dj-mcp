@@ -1,6 +1,7 @@
 ---
 name: claude-dj
 description: Run an autonomous radio DJ session using Strudel live-coded music. Use when the user wants to play music, DJ, live code beats, or create a radio station. Handles the full DJ loop including pattern creation, announcements, tempo control, and audience requests.
+license: AGPL-3.0
 compatibility: Requires the claude-dj MCP server to be configured. macOS recommended for text-to-speech DJ announcements via the say command.
 metadata:
   author: claude-dj-mcp
