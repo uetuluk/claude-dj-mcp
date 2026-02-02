@@ -70,7 +70,7 @@ Add to your MCP settings (e.g., `~/.config/claude-code/mcp.json`):
   "mcpServers": {
     "claude-dj": {
       "command": "node",
-      "args": ["/Users/uetuluk/claude-dj-mcp/dist/index.js"]
+      "args": ["~/claude-dj-mcp/dist/index.js"]
     }
   }
 }
