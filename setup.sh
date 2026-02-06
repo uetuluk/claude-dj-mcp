@@ -48,7 +48,7 @@ fi
 
 # Patch helpers.mjs: wrap double-stop cleanup in try-catch
 HELPERS="strudel/packages/superdough/helpers.mjs"
-if grep -q 'node.start(node.context.currentTime + 5);' "$HELPERS" 2>/dev/null && ! grep -q 'try {' "$HELPERS" 2>/dev/null; then
+if grep -q 'node.start(node.context.currentTime + 5);' "$HELPERS" 2>/dev/null && ! grep -q 'catch (_e2)' "$HELPERS" 2>/dev/null; then
   # Use a temporary Python script for the multi-line replacement since sed can't handle it cleanly
   python3 -c "
 import re
