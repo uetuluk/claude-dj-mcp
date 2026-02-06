@@ -240,6 +240,9 @@ function scheduleNextChunk(): void {
   // Render interval slightly less than chunk duration to keep the buffer fed
   const intervalMs = CHUNK_DURATION * 900;
   renderLoopTimer = setTimeout(() => {
-    renderAndBroadcast();
+    renderAndBroadcast().catch((err) => {
+      log.error("Unhandled render error:", err instanceof Error ? err.message : String(err));
+      scheduleNextChunk();
+    });
   }, intervalMs);
 }

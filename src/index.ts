@@ -565,6 +565,14 @@ server.tool(
 // --- Register prompts ---
 registerPrompts(server);
 
+// --- Global error handlers (prevent crashes from unhandled rejections) ---
+process.on("uncaughtException", (err) => {
+  log.error("Uncaught exception:", err instanceof Error ? err.message : String(err));
+});
+process.on("unhandledRejection", (reason) => {
+  log.error("Unhandled rejection:", reason instanceof Error ? reason.message : String(reason));
+});
+
 // --- Main ---
 async function main() {
   log.info("Claude DJ MCP server starting...");
