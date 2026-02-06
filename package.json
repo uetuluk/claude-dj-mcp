@@ -1,7 +1,7 @@
 {
   "name": "claude-dj-mcp",
-  "version": "0.1.0",
-  "description": "MCP server that lets Claude act as an autonomous radio DJ using Strudel",
+  "version": "0.2.0",
+  "description": "MCP server that lets Claude act as a network radio DJ, streaming live-coded music via Strudel",
   "license": "AGPL-3.0",
   "type": "module",
   "main": "dist/index.js",
@@ -18,6 +18,13 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
+    "@strudel/core": "file:./strudel/packages/core",
+    "@strudel/mini": "file:./strudel/packages/mini",
+    "@strudel/tonal": "file:./strudel/packages/tonal",
+    "@strudel/transpiler": "file:./strudel/packages/transpiler",
+    "lamejs": "^1.2.1",
+    "nanostores": "^1.1.0",
+    "node-web-audio-api": "^1.0.7",
     "open": "^10.1.0",
     "zod": "^3.24.0"
   },

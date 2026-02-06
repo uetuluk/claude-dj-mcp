@@ -1,23 +1,34 @@
+/**
+ * http-server.ts — HTTP server for the network radio station.
+ *
+ * Endpoints:
+ *   GET  /          — Listener HTML page
+ *   GET  /stream    — MP3 audio stream (chunked, keep-alive)
+ *   GET  /api/status — JSON: { playing, currentCode, cps, bpm, listenerCount, cyclePosition }
+ *   POST /api/request — Listener song requests
+ *   GET  /api/health  — Health check
+ */
+
 import http from "node:http";
 import { log } from "./logger.js";
 import { getHtmlPage } from "./html-page.js";
+import {
+  addClient,
+  getListenerCount,
+  getCyclePosition,
+  getCps,
+  getIsPlaying,
+} from "./stream-manager.js";
 
 const MAX_PORT = 6020;
 
-// --- State stores ---
+// ── State ────────────────────────────────────────────────────────────
 
-export interface BrowserState {
-  started: boolean;
-  activeCode: string;
-  error: string | null;
+export interface RadioState {
+  isPlaying: boolean;
+  currentPatternCode: string;
   cps: number;
-  lastUpdated: Date;
-}
-
-export interface PendingAction {
-  action: "evaluate" | "stop";
-  code?: string;
-  version: number;
+  listenerCount: number;
 }
 
 export interface UserRequest {
@@ -25,43 +36,28 @@ export interface UserRequest {
   timestamp: string;
 }
 
-let pendingAction: PendingAction = { action: "evaluate", code: "", version: 0 };
-let browserState: BrowserState = {
-  started: false,
-  activeCode: "",
-  error: null,
-  cps: 0.5,
-  lastUpdated: new Date(),
-};
+let currentPatternCode = "";
 let requestQueue: UserRequest[] = [];
 let serverInstance: http.Server | null = null;
 let serverPort = 0;
 
-// --- Public API for MCP tools ---
+// ── Public API for MCP tools ─────────────────────────────────────────
 
-export function getPendingAction(): PendingAction {
-  return { ...pendingAction };
+export function setCurrentPatternCode(code: string): void {
+  currentPatternCode = code;
 }
 
-export function getBrowserState(): BrowserState {
-  return { ...browserState };
+export function getCurrentPatternCode(): string {
+  return currentPatternCode;
 }
 
-export function setPendingCode(code: string): number {
-  pendingAction = {
-    action: "evaluate",
-    code,
-    version: pendingAction.version + 1,
+export function getRadioState(): RadioState {
+  return {
+    isPlaying: getIsPlaying(),
+    currentPatternCode,
+    cps: getCps(),
+    listenerCount: getListenerCount(),
   };
-  return pendingAction.version;
-}
-
-export function setPendingStop(): number {
-  pendingAction = {
-    action: "stop",
-    version: pendingAction.version + 1,
-  };
-  return pendingAction.version;
 }
 
 export function drainRequests(): UserRequest[] {
@@ -74,32 +70,7 @@ export function getServerPort(): number {
   return serverPort;
 }
 
-/**
- * Wait for the browser to report back after a pending action.
- * Polls browserState.lastUpdated for changes.
- */
-export function waitForBrowserUpdate(
-  timeoutMs: number = 2000
-): Promise<BrowserState> {
-  const before = browserState.lastUpdated.getTime();
-  return new Promise((resolve) => {
-    const start = Date.now();
-    const check = () => {
-      if (browserState.lastUpdated.getTime() > before) {
-        resolve({ ...browserState });
-        return;
-      }
-      if (Date.now() - start > timeoutMs) {
-        resolve({ ...browserState });
-        return;
-      }
-      setTimeout(check, 100);
-    };
-    check();
-  });
-}
-
-// --- HTTP request handling ---
+// ── HTTP helpers ─────────────────────────────────────────────────────
 
 function parseBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -130,6 +101,8 @@ function sendHtml(res: http.ServerResponse, html: string) {
   res.end(html);
 }
 
+// ── Request handler ──────────────────────────────────────────────────
+
 async function handleRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse
@@ -149,12 +122,12 @@ async function handleRequest(
 
   try {
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      const sessionId = url.searchParams.get("session") || "default";
-      sendHtml(res, getHtmlPage(sessionId, serverPort));
-    } else if (url.pathname === "/api/poll" && req.method === "GET") {
-      handlePoll(req, res, url);
-    } else if (url.pathname === "/api/state" && req.method === "POST") {
-      await handleStatePost(req, res);
+      sendHtml(res, getHtmlPage(serverPort));
+    } else if (url.pathname === "/stream" && req.method === "GET") {
+      // Register client for MP3 streaming
+      addClient(res);
+    } else if (url.pathname === "/api/status" && req.method === "GET") {
+      handleStatus(res);
     } else if (url.pathname === "/api/request" && req.method === "POST") {
       await handleRequestPost(req, res);
     } else if (url.pathname === "/api/health") {
@@ -168,41 +141,17 @@ async function handleRequest(
   }
 }
 
-function handlePoll(
-  _req: http.IncomingMessage,
-  res: http.ServerResponse,
-  _url: URL
-) {
+function handleStatus(res: http.ServerResponse) {
+  const cps = getCps();
+  const bpm = Math.round(cps * 240);
   sendJson(res, {
-    action: pendingAction.action,
-    code: pendingAction.code || null,
-    version: pendingAction.version,
-    cps: browserState.cps,
+    playing: getIsPlaying(),
+    currentCode: currentPatternCode,
+    cps,
+    bpm,
+    listenerCount: getListenerCount(),
+    cyclePosition: getCyclePosition(),
   });
-}
-
-async function handleStatePost(
-  req: http.IncomingMessage,
-  res: http.ServerResponse
-) {
-  const raw = await parseBody(req);
-  try {
-    const data = JSON.parse(raw);
-    browserState = {
-      started: Boolean(data.started),
-      activeCode: String(data.activeCode || ""),
-      error: data.error ? String(data.error) : null,
-      cps: typeof data.cps === "number" ? data.cps : browserState.cps,
-      lastUpdated: new Date(),
-    };
-    log.debug("Browser state updated:", {
-      started: browserState.started,
-      error: browserState.error,
-    });
-    sendJson(res, { ok: true });
-  } catch {
-    sendJson(res, { error: "Invalid JSON" }, 400);
-  }
 }
 
 async function handleRequestPost(
@@ -228,7 +177,7 @@ async function handleRequestPost(
   }
 }
 
-// --- Server lifecycle ---
+// ── Server lifecycle ─────────────────────────────────────────────────
 
 export function startHttpServer(port: number = 6002): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -247,10 +196,11 @@ export function startHttpServer(port: number = 6002): Promise<number> {
       }
     });
 
-    server.listen(port, () => {
+    // Bind to 0.0.0.0 for LAN access
+    server.listen(port, "0.0.0.0", () => {
       serverInstance = server;
       serverPort = port;
-      log.info(`HTTP server listening on port ${port}`);
+      log.info(`HTTP server listening on 0.0.0.0:${port}`);
       resolve(port);
     });
   });

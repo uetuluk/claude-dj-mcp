@@ -4,22 +4,36 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { exec } from "node:child_process";
+import { promisify } from "node:util";
+import { readFile, unlink } from "node:fs/promises";
+import { networkInterfaces, platform } from "node:os";
 import { log } from "./logger.js";
 import {
   startHttpServer,
   getServerPort,
-  setPendingCode,
-  setPendingStop,
-  getBrowserState,
   drainRequests,
-  waitForBrowserUpdate,
+  getRadioState,
+  setCurrentPatternCode,
 } from "./http-server.js";
+import {
+  setPattern,
+  setCps,
+  stop as stopStream,
+  getListenerCount,
+  getCps,
+  getIsPlaying,
+  getCyclePosition,
+  mixTtsAudio,
+} from "./stream-manager.js";
+import { initEngine, evaluatePattern } from "./audio-engine.js";
 import { getSounds } from "./sounds.js";
 import { registerPrompts } from "./prompts.js";
 
+const execAsync = promisify(exec);
+
 const server = new McpServer({
   name: "claude-dj",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // Track whether a session is active
@@ -27,10 +41,25 @@ let sessionActive = false;
 let sessionId = "";
 let sessionUrl = "";
 
+/**
+ * Get the first non-internal IPv4 address for LAN access.
+ */
+function getLanIp(): string {
+  const interfaces = networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name] || []) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return "localhost";
+}
+
 // --- Tool 1: start_session ---
 server.tool(
   "start_session",
-  "Start a DJ session: launches HTTP server and opens browser with Strudel REPL. User must click 'Start Audio' button.",
+  "Start a DJ session: launches HTTP server and initializes the audio engine. Returns stream URL with LAN IP. Anyone on the network can tune in.",
   {},
   async () => {
     try {
@@ -39,20 +68,28 @@ server.tool(
           content: [
             {
               type: "text",
-              text: `Session already active.\nSession ID: ${sessionId}\nURL: ${sessionUrl}\n\nIf the browser is closed, open: ${sessionUrl}`,
+              text: `Session already active.\nSession ID: ${sessionId}\nStream URL: ${sessionUrl}\n\nListeners can tune in at: ${sessionUrl}`,
             },
           ],
         };
       }
 
+      // Initialize the audio engine (loads Strudel, registers synth sounds)
+      await initEngine();
+
       const port = await startHttpServer();
       sessionId = `dj-${Date.now().toString(36)}`;
-      sessionUrl = `http://localhost:${port}?session=${sessionId}`;
+      const lanIp = getLanIp();
+      sessionUrl = `http://${lanIp}:${port}`;
       sessionActive = true;
 
-      // Open browser
-      const open = await import("open");
-      await open.default(sessionUrl);
+      // Optionally open the listener page in a browser
+      try {
+        const open = await import("open");
+        await open.default(`http://localhost:${port}`);
+      } catch {
+        // Non-critical if browser doesn't open
+      }
 
       log.info(`Session started: ${sessionId} at ${sessionUrl}`);
 
@@ -60,7 +97,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `DJ session started!\n\nSession ID: ${sessionId}\nURL: ${sessionUrl}\n\nIMPORTANT: Tell the user to click the "Start Audio" button in the browser.\nThen call get_session_state to confirm audio is active before playing patterns.`,
+            text: `DJ session started!\n\nSession ID: ${sessionId}\nStream URL: ${sessionUrl}\nLocal URL: http://localhost:${port}\n\nListeners on the LAN can tune in at ${sessionUrl}\nAudio is rendered server-side — no "Start Audio" button needed.\nCall play_pattern to start the music.`,
           },
         ],
       };
@@ -98,36 +135,33 @@ server.tool(
     }
 
     try {
-      const version = setPendingCode(code);
-      log.debug(`Pattern queued (v${version}):`, code.substring(0, 80));
+      const pattern = await evaluatePattern(code);
+      setPattern(pattern);
+      setCurrentPatternCode(code);
 
-      // Wait for browser to pick up and evaluate
-      const state = await waitForBrowserUpdate(3000);
+      log.info(`Pattern playing: ${code.substring(0, 80)}`);
 
-      if (state.error) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Pattern evaluation error: ${state.error}\n\nThe code was sent but the browser reported an error. Try simplifying the pattern.`,
-            },
-          ],
-          isError: true,
-        };
-      }
+      const cps = getCps();
+      const bpm = Math.round(cps * 240);
 
       return {
         content: [
           {
             type: "text",
-            text: `Pattern is playing (v${version}).\nBrowser state: started=${state.started}, cps=${state.cps}`,
+            text: `Pattern is playing.\nBPM: ${bpm}, CPS: ${cps}, Listeners: ${getListenerCount()}`,
           },
         ],
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
+      log.error("Pattern error:", msg);
       return {
-        content: [{ type: "text", text: `Error: ${msg}` }],
+        content: [
+          {
+            type: "text",
+            text: `Pattern evaluation error: ${msg}\n\nTry simplifying the pattern.`,
+          },
+        ],
         isError: true,
       };
     }
@@ -152,14 +186,15 @@ server.tool(
       };
     }
 
-    const version = setPendingStop();
-    log.info(`Stop queued (v${version})`);
+    stopStream();
+    setCurrentPatternCode("");
+    log.info("Music stopped");
 
     return {
       content: [
         {
           type: "text",
-          text: `Stop command sent (v${version}). Music will stop on next browser poll.`,
+          text: `Music stopped. Listeners: ${getListenerCount()}`,
         },
       ],
     };
@@ -184,8 +219,8 @@ server.tool(
       };
     }
 
-    const state = getBrowserState();
-    const bpm = Math.round(state.cps * 60 * 4);
+    const state = getRadioState();
+    const bpm = Math.round(state.cps * 240);
 
     return {
       content: [
@@ -193,12 +228,12 @@ server.tool(
           type: "text",
           text: JSON.stringify(
             {
-              started: state.started,
-              activeCode: state.activeCode,
-              error: state.error,
+              playing: state.isPlaying,
+              currentCode: state.currentPatternCode,
               cps: state.cps,
               bpm,
-              lastUpdated: state.lastUpdated.toISOString(),
+              listenerCount: state.listenerCount,
+              cyclePosition: getCyclePosition(),
             },
             null,
             2
@@ -254,8 +289,7 @@ server.tool(
       };
     }
 
-    const tempoCode = `setcps(${targetCps})`;
-    setPendingCode(tempoCode);
+    setCps(targetCps);
     const resultBpm = Math.round(targetCps * 240);
 
     log.info(`Tempo set: ${resultBpm} BPM (${targetCps} CPS)`);
@@ -274,13 +308,15 @@ server.tool(
 // --- Tool 6: dj_speak ---
 server.tool(
   "dj_speak",
-  "Use macOS text-to-speech to announce over the music. Fire-and-forget: returns immediately. Only works on macOS.",
+  "Use text-to-speech to announce over the music. All listeners hear the announcement in the stream. Works on macOS (say) and Linux (espeak-ng).",
   {
     text: z.string().max(500).describe("Text to speak aloud"),
     voice: z
       .string()
       .optional()
-      .describe('macOS voice name (e.g., "Samantha", "Alex", "Daniel")'),
+      .describe(
+        'Voice name. macOS: "Samantha", "Alex", "Daniel". Linux: "en", "en+f3" (espeak-ng voice)'
+      ),
     rate: z
       .number()
       .min(100)
@@ -289,37 +325,159 @@ server.tool(
       .describe("Speech rate in words per minute (default: 200)"),
   },
   async ({ text, voice, rate }) => {
-    // Shell-escape the text: replace single quotes with escaped version
     const escaped = text.replace(/'/g, "'\\''");
+    const tmpDir = "/tmp";
+    const ts = Date.now();
+    const wavPath = `${tmpDir}/dj-tts-${ts}.wav`;
 
-    let cmd = `say '${escaped}'`;
-    if (voice) {
-      const escapedVoice = voice.replace(/'/g, "'\\''");
-      cmd += ` -v '${escapedVoice}'`;
-    }
-    if (rate) {
-      cmd += ` -r ${Math.round(rate)}`;
-    }
+    log.info(`Speaking (to stream): "${text.substring(0, 50)}..."`);
 
-    log.info(`Speaking: "${text.substring(0, 50)}..."`);
+    try {
+      if (platform() === "darwin") {
+        // macOS: say → AIFF → afconvert → WAV
+        const aiffPath = `${tmpDir}/dj-tts-${ts}.aiff`;
+        let sayCmd = `say -o '${aiffPath}'`;
+        if (voice) {
+          const escapedVoice = voice.replace(/'/g, "'\\''");
+          sayCmd += ` -v '${escapedVoice}'`;
+        }
+        if (rate) {
+          sayCmd += ` -r ${Math.round(rate)}`;
+        }
+        sayCmd += ` '${escaped}'`;
 
-    // Fire and forget — don't await
-    exec(cmd, (err) => {
-      if (err) {
-        log.debug("Speech error (may not be macOS):", err.message);
+        await execAsync(sayCmd);
+        await execAsync(
+          `afconvert -d LEI16@44100 -c 2 -f WAVE '${aiffPath}' '${wavPath}'`
+        );
+        unlink(aiffPath).catch(() => {});
+      } else {
+        // Linux: espeak-ng outputs WAV directly
+        let espeakCmd = `espeak-ng`;
+        if (voice) {
+          const escapedVoice = voice.replace(/'/g, "'\\''");
+          espeakCmd += ` -v '${escapedVoice}'`;
+        }
+        if (rate) {
+          espeakCmd += ` -s ${Math.round(rate)}`;
+        }
+        espeakCmd += ` -w '${wavPath}' '${escaped}'`;
+
+        await execAsync(espeakCmd);
+
+        // espeak-ng outputs mono 22050Hz — resample to 44100Hz stereo via ffmpeg if available
+        const resampledPath = `${tmpDir}/dj-tts-${ts}-resampled.wav`;
+        try {
+          await execAsync(
+            `ffmpeg -y -i '${wavPath}' -ar 44100 -ac 2 '${resampledPath}' 2>/dev/null`
+          );
+          // Replace the original with the resampled version
+          await execAsync(`mv '${resampledPath}' '${wavPath}'`);
+        } catch {
+          // ffmpeg not available — parseWavPcm will handle mono/different sample rates
+          unlink(resampledPath).catch(() => {});
+        }
       }
-    });
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Speaking: "${text}"\n(Fire-and-forget via macOS 'say' command. No-op on non-macOS systems.)`,
-        },
-      ],
-    };
+      // Read WAV file and extract PCM data
+      const wavBuffer = await readFile(wavPath);
+      const pcm = parseWavPcm(wavBuffer);
+
+      // Mix into the stream
+      mixTtsAudio(pcm.left, pcm.right);
+
+      // Cleanup
+      unlink(wavPath).catch(() => {});
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Speaking (mixed into stream): "${text}"\nAll listeners will hear the announcement.`,
+          },
+        ],
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log.debug("TTS error:", msg);
+
+      // Cleanup on error
+      unlink(wavPath).catch(() => {});
+
+      const hint =
+        platform() === "darwin"
+          ? "macOS 'say' command required"
+          : "Linux: install espeak-ng (and optionally ffmpeg for resampling)";
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `TTS failed (${hint}): ${msg}`,
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 );
+
+/**
+ * Parse a 16-bit PCM WAV file into stereo Float32 arrays.
+ * Handles both mono and stereo input. Mono is duplicated to both channels.
+ */
+function parseWavPcm(buffer: Buffer): {
+  left: Float32Array;
+  right: Float32Array;
+} {
+  // Parse WAV header for channel count
+  const numChannels = buffer.readUInt16LE(22);
+
+  // Find the "data" chunk
+  let dataOffset = 44; // default WAV header size
+  let dataLength = buffer.length - 44;
+
+  for (let i = 0; i < buffer.length - 8; i++) {
+    if (
+      buffer[i] === 0x64 && // 'd'
+      buffer[i + 1] === 0x61 && // 'a'
+      buffer[i + 2] === 0x74 && // 't'
+      buffer[i + 3] === 0x61 // 'a'
+    ) {
+      dataLength = buffer.readUInt32LE(i + 4);
+      dataOffset = i + 8;
+      break;
+    }
+  }
+
+  const bytesPerFrame = 2 * numChannels; // 16-bit per channel
+  const numFrames = Math.floor(dataLength / bytesPerFrame);
+  const left = new Float32Array(numFrames);
+  const right = new Float32Array(numFrames);
+
+  if (numChannels >= 2) {
+    // Stereo (or more) — use first two channels
+    for (let i = 0; i < numFrames; i++) {
+      const offset = dataOffset + i * bytesPerFrame;
+      if (offset + 3 < buffer.length) {
+        left[i] = buffer.readInt16LE(offset) / 32768;
+        right[i] = buffer.readInt16LE(offset + 2) / 32768;
+      }
+    }
+  } else {
+    // Mono — duplicate to both channels
+    for (let i = 0; i < numFrames; i++) {
+      const offset = dataOffset + i * 2;
+      if (offset + 1 < buffer.length) {
+        const sample = buffer.readInt16LE(offset) / 32768;
+        left[i] = sample;
+        right[i] = sample;
+      }
+    }
+  }
+
+  return { left, right };
+}
 
 // --- Tool 7: check_requests ---
 server.tool(
@@ -365,14 +523,12 @@ server.tool(
     await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
 
     const requests = drainRequests();
-    const state = getBrowserState();
+    const cps = getCps();
+    const bpm = Math.round(cps * 240);
+    const listeners = getListenerCount();
 
     let text = `Waited ${seconds} seconds.\n`;
-    text += `Current state: started=${state.started}, cps=${state.cps}`;
-
-    if (state.error) {
-      text += `\nBrowser error: ${state.error}`;
-    }
+    text += `Playing: ${getIsPlaying()}, BPM: ${bpm}, Listeners: ${listeners}`;
 
     if (requests.length > 0) {
       text += `\n\n${requests.length} pending request(s):\n`;

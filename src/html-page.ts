@@ -1,4 +1,17 @@
-export function getHtmlPage(sessionId: string, port: number): string {
+/**
+ * html-page.ts — Listener UI for the network radio station.
+ *
+ * Features:
+ * - <audio> element for MP3 stream playback
+ * - "Tune In" button (satisfies mobile autoplay policy)
+ * - <strudel-editor> in read-only display mode for pattern visualization
+ *   - getTime() uses a synthetic clock synced via /api/status polling
+ *   - Audio output is a no-op (actual audio comes from the MP3 stream)
+ * - BPM, listener count, connection status display
+ * - Request bar for song/vibe requests to the DJ
+ */
+
+export function getHtmlPage(port: number): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -29,10 +42,6 @@ export function getHtmlPage(sessionId: string, port: number): string {
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
     }
-    #header .session-info {
-      font-size: 0.8em;
-      color: #888;
-    }
     #status {
       display: flex;
       align-items: center;
@@ -53,14 +62,16 @@ export function getHtmlPage(sessionId: string, port: number): string {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.5; }
     }
-    #start-audio-container {
+    #tune-in-container {
       display: flex;
       justify-content: center;
-      padding: 20px;
+      align-items: center;
+      padding: 16px;
+      gap: 16px;
     }
-    #start-audio-btn {
-      padding: 16px 40px;
-      font-size: 1.2em;
+    #tune-in-btn {
+      padding: 14px 36px;
+      font-size: 1.1em;
       font-family: 'Courier New', monospace;
       background: linear-gradient(135deg, #a855f7, #6366f1);
       color: white;
@@ -69,15 +80,22 @@ export function getHtmlPage(sessionId: string, port: number): string {
       cursor: pointer;
       transition: transform 0.2s, box-shadow 0.2s;
     }
-    #start-audio-btn:hover {
+    #tune-in-btn:hover {
       transform: scale(1.05);
       box-shadow: 0 0 20px rgba(168, 85, 247, 0.5);
     }
-    #start-audio-btn:disabled {
+    #tune-in-btn:disabled {
       opacity: 0.5;
       cursor: not-allowed;
       transform: none;
-      box-shadow: none;
+    }
+    #listener-badge {
+      background: #1a1a2e;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-size: 0.85em;
+      color: #a855f7;
     }
     #editor-container {
       flex: 1;
@@ -166,19 +184,21 @@ export function getHtmlPage(sessionId: string, port: number): string {
       <div class="dot" id="status-dot"></div>
       <span id="status-text">Connecting...</span>
     </div>
-    <div class="session-info">Session: ${sessionId}</div>
   </div>
 
-  <div id="start-audio-container">
-    <button id="start-audio-btn">Start Audio</button>
+  <div id="tune-in-container">
+    <button id="tune-in-btn">Tune In</button>
+    <div id="listener-badge">Listeners: --</div>
   </div>
+
+  <!-- Hidden audio element for the MP3 stream -->
+  <audio id="radio" src="/stream" preload="none"></audio>
 
   <div id="editor-container">
     <strudel-editor id="strudel-repl">
 <!--
-// Welcome to Claude DJ Radio!
-// Click "Start Audio" above, then the DJ will take over.
-s("bd sd:1 hh sd:2").gain(0.8)
+// Claude DJ Radio - Listening...
+// The DJ is crafting something...
 -->
     </strudel-editor>
   </div>
@@ -191,34 +211,30 @@ s("bd sd:1 hh sd:2").gain(0.8)
 
   <div id="footer">
     <span id="footer-bpm">BPM: --</span>
-    <span id="footer-state">Stopped</span>
-    <span id="footer-connection">Disconnected</span>
+    <span id="footer-state">Waiting</span>
+    <span id="footer-connection">Connecting...</span>
   </div>
 
   <div id="request-toast">Request sent!</div>
 
   <script src="https://unpkg.com/@strudel/repl@latest"></script>
   <script>
-    const SESSION_ID = "${sessionId}";
-    const BASE_URL = "http://localhost:${port}";
-    const POLL_INTERVAL = 1000;
+    const BASE_URL = window.location.origin;
+    const STATUS_POLL_INTERVAL = 2000;
 
-    let lastVersion = 0;
-    let audioStarted = false;
+    // Synthetic clock for Strudel visualization
+    let baseCycle = 0;
+    let baseTime = 0;
+    let currentCps = 0.5;
+    let tunedIn = false;
     let connected = false;
-    let pollTimer = null;
-    let editorReady = false;
+    let lastCode = '';
 
-    // Track state from the strudel-editor 'update' event
-    let strudelState = {
-      started: false,
-      activeCode: '',
-      error: null,
-    };
-
+    const audio = document.getElementById('radio');
+    const tuneInBtn = document.getElementById('tune-in-btn');
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
-    const startBtn = document.getElementById('start-audio-btn');
+    const listenerBadge = document.getElementById('listener-badge');
     const requestInput = document.getElementById('request-input');
     const sendRequestBtn = document.getElementById('send-request-btn');
     const footerBpm = document.getElementById('footer-bpm');
@@ -226,75 +242,34 @@ s("bd sd:1 hh sd:2").gain(0.8)
     const footerConnection = document.getElementById('footer-connection');
     const toast = document.getElementById('request-toast');
 
-    // Get the StrudelMirror instance from the <strudel-editor> element.
-    // The web component creates .editor (StrudelMirror) in connectedCallback
-    // via setTimeout, so it may be null initially.
     function getStrudelMirror() {
       const el = document.getElementById('strudel-repl');
       return el && el.editor ? el.editor : null;
     }
-
-    // Wait for the editor to become available
-    function waitForEditor() {
-      return new Promise((resolve) => {
-        const check = () => {
-          const mirror = getStrudelMirror();
-          if (mirror) {
-            editorReady = true;
-            resolve(mirror);
-          } else {
-            setTimeout(check, 100);
-          }
-        };
-        check();
-      });
-    }
-
-    // Listen for state updates from the <strudel-editor> custom event
-    const replEl = document.getElementById('strudel-repl');
-    replEl.addEventListener('update', (e) => {
-      const detail = e.detail || {};
-      strudelState.started = !!detail.started;
-      strudelState.activeCode = detail.activeCode || '';
-      strudelState.error = detail.error ? (detail.error.message || String(detail.error)) : null;
-
-      // Update UI based on strudel state
-      if (strudelState.started) {
-        audioStarted = true;
-        updateStatus('playing', 'Playing');
-        footerState.textContent = 'Playing';
-        startBtn.textContent = 'Audio Started';
-        startBtn.disabled = true;
-      }
-    });
 
     function updateStatus(state, text) {
       statusDot.className = 'dot ' + state;
       statusText.textContent = text;
     }
 
-    // Start Audio button
-    startBtn.addEventListener('click', async () => {
-      startBtn.disabled = true;
-      startBtn.textContent = 'Starting...';
-      try {
-        const mirror = await waitForEditor();
-        // evaluate() triggers audio context init via user gesture
-        await mirror.evaluate(true);
-        audioStarted = true;
-        updateStatus('playing', 'Playing');
-        footerState.textContent = 'Playing';
-        startBtn.textContent = 'Audio Started';
-        reportState();
-      } catch (e) {
-        console.error('Failed to start audio:', e);
-        startBtn.disabled = false;
-        startBtn.textContent = 'Start Audio (retry)';
-        updateStatus('error', 'Error starting audio');
-      }
+    // Tune In button
+    tuneInBtn.addEventListener('click', () => {
+      tuneInBtn.disabled = true;
+      tuneInBtn.textContent = 'Tuning in...';
+      audio.play().then(() => {
+        tunedIn = true;
+        tuneInBtn.textContent = 'Listening';
+        updateStatus('playing', 'On Air');
+        footerState.textContent = 'Listening';
+      }).catch((e) => {
+        console.error('Audio play failed:', e);
+        tuneInBtn.disabled = false;
+        tuneInBtn.textContent = 'Tune In (retry)';
+        updateStatus('error', 'Playback error');
+      });
     });
 
-    // Send request
+    // Request handling
     function sendRequest() {
       const text = requestInput.value.trim();
       if (!text) return;
@@ -302,7 +277,7 @@ s("bd sd:1 hh sd:2").gain(0.8)
       fetch(BASE_URL + '/api/request', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: SESSION_ID, text })
+        body: JSON.stringify({ text })
       }).then(() => {
         requestInput.value = '';
         toast.classList.add('show');
@@ -315,96 +290,55 @@ s("bd sd:1 hh sd:2").gain(0.8)
       if (e.key === 'Enter') sendRequest();
     });
 
-    // Report browser state to server
-    async function reportState() {
+    // Poll /api/status for metadata and visualization sync
+    async function pollStatus() {
       try {
-        const mirror = getStrudelMirror();
-        let cps = 0.5;
-
-        if (mirror) {
-          try {
-            if (mirror.repl && mirror.repl.scheduler) {
-              cps = mirror.repl.scheduler.cps || 0.5;
-            }
-          } catch (e) { /* ignore */ }
-        }
-
-        await fetch(BASE_URL + '/api/state', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sessionId: SESSION_ID,
-            started: strudelState.started || audioStarted,
-            activeCode: strudelState.activeCode || (mirror ? mirror.code : ''),
-            error: strudelState.error,
-            cps
-          })
-        });
-      } catch (e) {
-        // Connection lost
-      }
-    }
-
-    // Poll for pending actions from MCP server
-    async function poll() {
-      try {
-        const res = await fetch(BASE_URL + '/api/poll?sessionId=' + encodeURIComponent(SESSION_ID));
+        const res = await fetch(BASE_URL + '/api/status');
         if (!res.ok) return;
-
         const data = await res.json();
 
         if (!connected) {
           connected = true;
           footerConnection.textContent = 'Connected';
-          if (!audioStarted) {
-            updateStatus('connected', 'Connected - Click Start Audio');
+          if (!tunedIn) {
+            updateStatus('connected', 'Connected - Click Tune In');
           }
         }
 
-        // Check for new version with pending action
-        if (data.version > lastVersion && data.action) {
-          lastVersion = data.version;
+        // Update sync clock
+        baseCycle = data.cyclePosition || 0;
+        baseTime = performance.now();
+        currentCps = data.cps || 0.5;
+
+        // Update UI
+        footerBpm.textContent = 'BPM: ' + (data.bpm || '--');
+        listenerBadge.textContent = 'Listeners: ' + (data.listenerCount || 0);
+
+        if (data.playing) {
+          if (tunedIn) {
+            updateStatus('playing', 'On Air');
+            footerState.textContent = 'Listening';
+          }
+        } else {
+          updateStatus('connected', 'DJ is silent');
+          footerState.textContent = 'Waiting for DJ';
+        }
+
+        // Update Strudel editor visualization if code changed
+        if (data.currentCode && data.currentCode !== lastCode) {
+          lastCode = data.currentCode;
           const mirror = getStrudelMirror();
-
-          if (!mirror) {
-            console.warn('Editor not ready yet, skipping action');
-          } else if (data.action === 'evaluate' && data.code) {
+          if (mirror) {
             try {
-              mirror.setCode(data.code);
+              mirror.setCode(data.currentCode);
+              // Evaluate to update visualization (audio output is no-op)
               await mirror.evaluate(true);
-              audioStarted = true;
-              updateStatus('playing', 'Playing');
-              footerState.textContent = 'Playing';
-              startBtn.textContent = 'Audio Started';
-              startBtn.disabled = true;
             } catch (e) {
-              console.error('Evaluate error:', e);
-              updateStatus('error', 'Error: ' + (e.message || e));
-              strudelState.error = e.message || String(e);
-            }
-          } else if (data.action === 'stop') {
-            try {
-              await mirror.stop();
-              strudelState.started = false;
-              updateStatus('connected', 'Stopped');
-              footerState.textContent = 'Stopped';
-            } catch (e) {
-              console.error('Stop error:', e);
+              // Visualization errors are non-critical
+              console.debug('Viz update error:', e);
             }
           }
         }
-
-        // Update BPM display from mirror scheduler
-        const mirror = getStrudelMirror();
-        if (mirror && mirror.repl && mirror.repl.scheduler) {
-          const cps = mirror.repl.scheduler.cps || 0.5;
-          const bpm = Math.round(cps * 60 * 4);
-          footerBpm.textContent = 'BPM: ' + bpm;
-        }
-
-        // Always report state back
-        await reportState();
-
       } catch (e) {
         if (connected) {
           connected = false;
@@ -415,8 +349,8 @@ s("bd sd:1 hh sd:2").gain(0.8)
     }
 
     // Start polling
-    pollTimer = setInterval(poll, POLL_INTERVAL);
-    poll();
+    setInterval(pollStatus, STATUS_POLL_INTERVAL);
+    pollStatus();
   </script>
 </body>
 </html>`;
