@@ -113,8 +113,10 @@ export async function initEngine(): Promise<void> {
     log.debug("[superdough]", ...args);
   });
 
-  // Create a temporary AudioContext to bootstrap superdough (needed for synth registration)
-  const bootCtx = new NodeAudioContext() as unknown;
+  // Create a temporary OfflineAudioContext to bootstrap superdough.
+  // We use OfflineAudioContext instead of AudioContext to avoid requiring
+  // a real audio device (headless servers have no sound card).
+  const bootCtx = new NodeOfflineAudioContext(CHANNELS, SAMPLE_RATE, SAMPLE_RATE) as unknown;
   audioContextMod.setAudioContext(bootCtx);
 
   // Register synth sounds (sine, square, sawtooth, triangle, supersaw, etc.)
@@ -128,9 +130,6 @@ export async function initEngine(): Promise<void> {
     import("@strudel/mini"),
     import("@strudel/tonal"),
   );
-
-  // Close the bootstrap context — we'll make fresh OfflineAudioContexts per render
-  await (bootCtx as InstanceType<typeof NodeAudioContext>).close();
 
   engineInitialized = true;
   log.info("Audio engine initialized (synth sounds registered)");
