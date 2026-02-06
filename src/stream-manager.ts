@@ -15,8 +15,9 @@ import { renderChunk, SAMPLE_RATE } from "./audio-engine.js";
 import { Mp3StreamEncoder } from "./mp3-encoder.js";
 import { log } from "./logger.js";
 
-// Duration in seconds per render chunk
-const CHUNK_DURATION = 2.0;
+// Duration in seconds per render chunk.
+// Smaller chunks = lower latency but more CPU overhead.
+const CHUNK_DURATION = 0.5;
 
 // ── State ────────────────────────────────────────────────────────────
 
