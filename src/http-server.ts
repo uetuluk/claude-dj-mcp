@@ -15,7 +15,6 @@ import { getHtmlPage } from "./html-page.js";
 import {
   addClient,
   getListenerCount,
-  getCyclePosition,
   getCps,
   getIsPlaying,
 } from "./stream-manager.js";
@@ -150,7 +149,6 @@ function handleStatus(res: http.ServerResponse) {
     cps,
     bpm,
     listenerCount: getListenerCount(),
-    cyclePosition: getCyclePosition(),
   });
 }
 

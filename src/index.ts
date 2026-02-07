@@ -22,7 +22,6 @@ import {
   getListenerCount,
   getCps,
   getIsPlaying,
-  getCyclePosition,
   mixTtsAudio,
 } from "./stream-manager.js";
 import { initEngine, evaluatePattern } from "./audio-engine.js";
@@ -136,19 +135,19 @@ server.tool(
 
     try {
       const pattern = await evaluatePattern(code);
-      setPattern(pattern);
+      const cps = getCps();
+
+      log.info(`Pre-rendering pattern: ${code.substring(0, 80)}`);
+      await setPattern(pattern, cps);
       setCurrentPatternCode(code);
 
-      log.info(`Pattern playing: ${code.substring(0, 80)}`);
-
-      const cps = getCps();
       const bpm = Math.round(cps * 240);
 
       return {
         content: [
           {
             type: "text",
-            text: `Pattern is playing.\nBPM: ${bpm}, CPS: ${cps}, Listeners: ${getListenerCount()}`,
+            text: `Pattern pre-rendered and playing.\nBPM: ${bpm}, CPS: ${cps}, Listeners: ${getListenerCount()}`,
           },
         ],
       };
@@ -233,7 +232,6 @@ server.tool(
               cps: state.cps,
               bpm,
               listenerCount: state.listenerCount,
-              cyclePosition: getCyclePosition(),
             },
             null,
             2
@@ -289,7 +287,7 @@ server.tool(
       };
     }
 
-    setCps(targetCps);
+    await setCps(targetCps);
     const resultBpm = Math.round(targetCps * 240);
 
     log.info(`Tempo set: ${resultBpm} BPM (${targetCps} CPS)`);

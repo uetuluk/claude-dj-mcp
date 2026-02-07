@@ -1,11 +1,11 @@
 /**
- * stream-manager.ts — Render loop + MP3 broadcast to connected listeners.
+ * stream-manager.ts — Pre-rendered PCM buffer + MP3 broadcast to connected listeners.
  *
  * Manages:
  * - Connected HTTP clients (ServerResponse objects)
- * - Continuous render loop: every ~2s, renders the next chunk of the current pattern,
- *   encodes to MP3, and writes to all connected clients
- * - Pattern switching with short crossfade
+ * - Pre-rendering entire patterns to PCM buffers upfront
+ * - Playback loop: reads small chunks from the buffer, mixes TTS, encodes MP3, broadcasts
+ * - Pattern switching: pre-render new buffer → atomically swap
  * - CPS (tempo) control
  * - TTS audio mixing (DJ announcements mixed into the stream)
  */
@@ -15,19 +15,24 @@ import { renderChunk, SAMPLE_RATE } from "./audio-engine.js";
 import { Mp3StreamEncoder } from "./mp3-encoder.js";
 import { log } from "./logger.js";
 
-// Duration in seconds per render chunk.
-// Larger chunks reduce per-chunk overhead (OfflineAudioContext creation,
-// superdough init) at the cost of higher latency. On a 2-vCPU VPS the
-// render barely keeps up at 0.5s — 2s gives much more headroom.
+// Duration in seconds per playback chunk.
+// Since we're just reading from a pre-rendered buffer (memcpy + encode),
+// this is no longer CPU-bound. 2s keeps latency reasonable.
 const CHUNK_DURATION = 2.0;
+
+// Duration of the pre-rendered loop buffer in seconds.
+const BUFFER_DURATION = 30.0;
 
 // ── State ────────────────────────────────────────────────────────────
 
 let currentPattern: unknown = null;
 let currentCps = 0.5;
-let cyclePosition = 0;
 let isPlaying = false;
 let renderLoopTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Pre-rendered PCM loop buffer
+let pcmBuffer: { left: Float32Array; right: Float32Array } | null = null;
+let bufferPosition = 0; // current sample offset into pcmBuffer
 
 const clients = new Set<http.ServerResponse>();
 let encoder: Mp3StreamEncoder = new Mp3StreamEncoder();
@@ -36,18 +41,10 @@ let encoder: Mp3StreamEncoder = new Mp3StreamEncoder();
 const ttsQueue: Array<{ left: Float32Array; right: Float32Array }> = [];
 let ttsOffset = 0; // how far into the current TTS buffer we've consumed
 
-// Scheduling: pace rendering to stay ~2 chunks ahead of real-time.
-let streamStartTime = 0;
-let totalAudioSent = 0;
-
 // ── Public API ───────────────────────────────────────────────────────
 
 export function getListenerCount(): number {
   return clients.size;
-}
-
-export function getCyclePosition(): number {
-  return cyclePosition;
 }
 
 export function getCps(): number {
@@ -59,10 +56,26 @@ export function getIsPlaying(): boolean {
 }
 
 /**
- * Set a new pattern. Starts the render loop if not running.
+ * Set a new pattern and pre-render it to a PCM buffer.
+ * Blocks during rendering (~7-12s on VPS). Starts playback loop if not running.
  */
-export function setPattern(pattern: unknown): void {
+export async function setPattern(pattern: unknown, cps: number): Promise<void> {
   currentPattern = pattern;
+  currentCps = cps;
+
+  // Pre-render the entire pattern to a PCM buffer
+  const cyclesToRender = cps * BUFFER_DURATION;
+  log.info(`Pre-rendering ${BUFFER_DURATION}s of audio (${cyclesToRender.toFixed(1)} cycles at ${cps} CPS)...`);
+
+  const startTime = Date.now();
+  const result = await renderChunk(pattern, 0, cyclesToRender, cps);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  log.info(`Pre-render complete in ${elapsed}s (${result.left.length} samples)`);
+
+  // Atomically swap the buffer
+  pcmBuffer = result;
+  bufferPosition = 0;
+
   if (!isPlaying) {
     start();
   }
@@ -70,30 +83,35 @@ export function setPattern(pattern: unknown): void {
 
 /**
  * Update the tempo (cycles per second).
+ * If a pattern is currently playing, re-renders at the new tempo.
  */
-export function setCps(cps: number): void {
+export async function setCps(cps: number): Promise<void> {
   currentCps = cps;
+  if (currentPattern && isPlaying) {
+    // Re-render current pattern at new tempo
+    await setPattern(currentPattern, cps);
+  }
 }
 
 /**
- * Start the render loop.
+ * Start the playback loop.
  */
 export function start(): void {
   if (isPlaying) return;
   isPlaying = true;
   encoder = new Mp3StreamEncoder();
-  streamStartTime = 0;
-  totalAudioSent = 0;
   scheduleNextChunk();
   log.info("Stream started");
 }
 
 /**
- * Stop playback. Sends silence and stops the render loop.
+ * Stop playback. Sends silence and stops the playback loop.
  */
 export function stop(): void {
   isPlaying = false;
   currentPattern = null;
+  pcmBuffer = null;
+  bufferPosition = 0;
   if (renderLoopTimer) {
     clearTimeout(renderLoopTimer);
     renderLoopTimer = null;
@@ -130,7 +148,7 @@ export function addClient(res: http.ServerResponse): void {
 
 /**
  * Queue TTS audio (PCM Float32 stereo) for mixing into the stream.
- * The audio will be mixed on top of the music in subsequent render cycles.
+ * The audio will be mixed on top of the music in subsequent playback cycles.
  */
 export function mixTtsAudio(left: Float32Array, right: Float32Array): void {
   ttsQueue.push({ left, right });
@@ -195,48 +213,43 @@ function mixTts(
 }
 
 /**
- * Render one chunk, encode to MP3, broadcast, and schedule the next.
+ * Read a chunk from the pre-rendered PCM buffer, mix TTS, encode to MP3, broadcast.
  */
-async function renderAndBroadcast(): Promise<void> {
+async function playAndBroadcast(): Promise<void> {
   if (!isPlaying) return;
 
   try {
-    const cycleStart = cyclePosition;
-    const cycleDuration = currentCps * CHUNK_DURATION;
-    const cycleEnd = cycleStart + cycleDuration;
-
+    const chunkSamples = Math.ceil(CHUNK_DURATION * SAMPLE_RATE);
     let left: Float32Array;
     let right: Float32Array;
 
-    if (currentPattern) {
-      const result = await renderChunk(
-        currentPattern,
-        cycleStart,
-        cycleEnd,
-        currentCps
-      );
-      left = result.left;
-      right = result.right;
+    if (pcmBuffer) {
+      left = new Float32Array(chunkSamples);
+      right = new Float32Array(chunkSamples);
+      const bufLen = pcmBuffer.left.length;
+
+      // Copy from circular buffer
+      for (let i = 0; i < chunkSamples; i++) {
+        const srcIdx = (bufferPosition + i) % bufLen;
+        left[i] = pcmBuffer.left[srcIdx];
+        right[i] = pcmBuffer.right[srcIdx];
+      }
+      bufferPosition = (bufferPosition + chunkSamples) % bufLen;
     } else {
-      // No pattern: silence
-      const samples = Math.ceil(CHUNK_DURATION * SAMPLE_RATE);
-      left = new Float32Array(samples);
-      right = new Float32Array(samples);
+      // No buffer: silence
+      left = new Float32Array(chunkSamples);
+      right = new Float32Array(chunkSamples);
     }
 
     // Mix TTS audio on top
     mixTts(left, right);
 
-    // Encode to MP3
+    // Encode to MP3 and broadcast
     const mp3Data = encoder.encodeChunk(left, right);
     broadcast(mp3Data);
-
-    // Advance cycle position and track total audio sent
-    cyclePosition = cycleEnd;
-    totalAudioSent += CHUNK_DURATION;
   } catch (err) {
     log.error(
-      "Render error:",
+      "Playback error:",
       err instanceof Error ? err.message : String(err)
     );
   }
@@ -245,22 +258,17 @@ async function renderAndBroadcast(): Promise<void> {
   scheduleNextChunk();
 }
 
+/**
+ * Schedule the next playback chunk.
+ * Since playback is just memcpy + encode (~5ms), a simple setTimeout suffices.
+ */
 function scheduleNextChunk(): void {
   if (!isPlaying) return;
 
-  const now = Date.now();
-  if (streamStartTime === 0) streamStartTime = now;
-  const wallElapsed = (now - streamStartTime) / 1000;
-  const aheadBy = totalAudioSent - wallElapsed; // seconds ahead of real-time
-
-  // If we're more than one chunk ahead, wait. Otherwise render immediately.
-  // This keeps us ~1 chunk buffered without pegging the CPU.
-  const waitMs = aheadBy > CHUNK_DURATION ? (aheadBy - CHUNK_DURATION) * 1000 : 0;
-
   renderLoopTimer = setTimeout(() => {
-    renderAndBroadcast().catch((err) => {
-      log.error("Unhandled render error:", err instanceof Error ? err.message : String(err));
+    playAndBroadcast().catch((err) => {
+      log.error("Unhandled playback error:", err instanceof Error ? err.message : String(err));
       scheduleNextChunk();
     });
-  }, Math.max(waitMs, 10));
+  }, CHUNK_DURATION * 1000);
 }
