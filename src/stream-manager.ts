@@ -36,11 +36,9 @@ let encoder: Mp3StreamEncoder = new Mp3StreamEncoder();
 const ttsQueue: Array<{ left: Float32Array; right: Float32Array }> = [];
 let ttsOffset = 0; // how far into the current TTS buffer we've consumed
 
-// Buffer-ahead scheduling: render chunks as fast as possible until we're
-// BUFFER_AHEAD_MS ahead of real-time, then pace to avoid runaway CPU usage.
+// Scheduling: pace rendering to stay ~2 chunks ahead of real-time.
 let streamStartTime = 0;
 let totalAudioSent = 0;
-const BUFFER_AHEAD_MS = 6000;
 
 // ── Public API ───────────────────────────────────────────────────────
 
@@ -250,21 +248,19 @@ async function renderAndBroadcast(): Promise<void> {
 function scheduleNextChunk(): void {
   if (!isPlaying) return;
 
-  // Calculate how far ahead of real-time our audio buffer is.
-  // If we've sent more audio than wall-clock elapsed, we're ahead.
   const now = Date.now();
   if (streamStartTime === 0) streamStartTime = now;
   const wallElapsed = (now - streamStartTime) / 1000;
-  const aheadBy = (totalAudioSent - wallElapsed) * 1000; // ms
+  const aheadBy = totalAudioSent - wallElapsed; // seconds ahead of real-time
 
-  // If we're far enough ahead, wait before rendering the next chunk.
-  // Otherwise render immediately to build up buffer.
-  const delay = aheadBy > BUFFER_AHEAD_MS ? aheadBy - BUFFER_AHEAD_MS : 0;
+  // If we're more than one chunk ahead, wait. Otherwise render immediately.
+  // This keeps us ~1 chunk buffered without pegging the CPU.
+  const waitMs = aheadBy > CHUNK_DURATION ? (aheadBy - CHUNK_DURATION) * 1000 : 0;
 
   renderLoopTimer = setTimeout(() => {
     renderAndBroadcast().catch((err) => {
       log.error("Unhandled render error:", err instanceof Error ? err.message : String(err));
       scheduleNextChunk();
     });
-  }, Math.max(delay, 10));
+  }, Math.max(waitMs, 10));
 }
