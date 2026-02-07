@@ -36,6 +36,12 @@ let encoder: Mp3StreamEncoder = new Mp3StreamEncoder();
 const ttsQueue: Array<{ left: Float32Array; right: Float32Array }> = [];
 let ttsOffset = 0; // how far into the current TTS buffer we've consumed
 
+// Buffer-ahead scheduling: render chunks as fast as possible until we're
+// BUFFER_AHEAD_MS ahead of real-time, then pace to avoid runaway CPU usage.
+let streamStartTime = 0;
+let totalAudioSent = 0;
+const BUFFER_AHEAD_MS = 6000;
+
 // ── Public API ───────────────────────────────────────────────────────
 
 export function getListenerCount(): number {
@@ -78,6 +84,8 @@ export function start(): void {
   if (isPlaying) return;
   isPlaying = true;
   encoder = new Mp3StreamEncoder();
+  streamStartTime = 0;
+  totalAudioSent = 0;
   scheduleNextChunk();
   log.info("Stream started");
 }
@@ -128,8 +136,9 @@ export function addClient(res: http.ServerResponse): void {
  */
 export function mixTtsAudio(left: Float32Array, right: Float32Array): void {
   ttsQueue.push({ left, right });
-  ttsOffset = 0;
-  log.debug(`TTS audio queued (${left.length} samples)`);
+  // Don't reset ttsOffset here — a previous entry may still be mid-playback.
+  // ttsOffset is reset to 0 in mixTts() when an entry is fully consumed.
+  log.debug(`TTS audio queued (${left.length} samples, queue depth: ${ttsQueue.length})`);
 }
 
 // ── Internal ─────────────────────────────────────────────────────────
@@ -224,8 +233,9 @@ async function renderAndBroadcast(): Promise<void> {
     const mp3Data = encoder.encodeChunk(left, right);
     broadcast(mp3Data);
 
-    // Advance cycle position
+    // Advance cycle position and track total audio sent
     cyclePosition = cycleEnd;
+    totalAudioSent += CHUNK_DURATION;
   } catch (err) {
     log.error(
       "Render error:",
@@ -239,12 +249,22 @@ async function renderAndBroadcast(): Promise<void> {
 
 function scheduleNextChunk(): void {
   if (!isPlaying) return;
-  // Render interval slightly less than chunk duration to keep the buffer fed
-  const intervalMs = CHUNK_DURATION * 900;
+
+  // Calculate how far ahead of real-time our audio buffer is.
+  // If we've sent more audio than wall-clock elapsed, we're ahead.
+  const now = Date.now();
+  if (streamStartTime === 0) streamStartTime = now;
+  const wallElapsed = (now - streamStartTime) / 1000;
+  const aheadBy = (totalAudioSent - wallElapsed) * 1000; // ms
+
+  // If we're far enough ahead, wait before rendering the next chunk.
+  // Otherwise render immediately to build up buffer.
+  const delay = aheadBy > BUFFER_AHEAD_MS ? aheadBy - BUFFER_AHEAD_MS : 0;
+
   renderLoopTimer = setTimeout(() => {
     renderAndBroadcast().catch((err) => {
       log.error("Unhandled render error:", err instanceof Error ? err.message : String(err));
       scheduleNextChunk();
     });
-  }, intervalMs);
+  }, Math.max(delay, 10));
 }
