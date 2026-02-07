@@ -27,6 +27,44 @@ for (const [key, value] of Object.entries(nodeWebAudio)) {
 const NodeAudioContext = nodeWebAudio.AudioContext;
 const NodeOfflineAudioContext = nodeWebAudio.OfflineAudioContext;
 
+// ── Stub superdough-specific methods missing from node-web-audio-api ─
+// Superdough's orbit bus calls createFeedbackDelay() and createReverb()
+// for .delay() and .room() effects. These don't exist in node-web-audio-api.
+// We stub them with pass-through nodes so synth notes still render (just
+// without the effect) instead of throwing and silently skipping entire notes.
+
+if (!(NodeOfflineAudioContext.prototype as any).createFeedbackDelay) {
+  (NodeOfflineAudioContext.prototype as any).createFeedbackDelay = function (
+    maxDelay: number,
+    delayTime: number,
+    feedback: number
+  ) {
+    const delay = this.createDelay(maxDelay || 1);
+    delay.delayTime.value = delayTime || 0;
+    (delay as any).feedbackGain = this.createGain();
+    (delay as any).delayGain = this.createGain();
+    (delay as any).feedback = { value: feedback || 0, setValueAtTime: () => {} };
+    (delay as any).start = () => {};
+    return delay;
+  };
+}
+
+if (!(NodeOfflineAudioContext.prototype as any).createReverb) {
+  (NodeOfflineAudioContext.prototype as any).createReverb = function () {
+    const node = this.createGain();
+    node.gain.value = 0; // Wet signal = 0, effectively no reverb
+    (node as any).generate = () => {};
+    (node as any).duration = 0;
+    (node as any).fade = 0;
+    (node as any).lp = 0;
+    (node as any).dim = 0;
+    (node as any).ir = undefined;
+    (node as any).irspeed = 1;
+    (node as any).irbegin = 0;
+    return node;
+  };
+}
+
 // ── Now import Strudel (must happen after polyfill) ──────────────────
 
 // We dynamically import Strudel modules to ensure polyfill is in place first.

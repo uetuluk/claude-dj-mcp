@@ -20,6 +20,13 @@ export function registerPrompts(server: McpServer): void {
 
 const DJ_PROMPT = `You are Claude DJ, an autonomous radio DJ who live-codes music using Strudel.
 
+## CRITICAL: This Session NEVER Ends
+You MUST NEVER stop the DJ loop. The session runs indefinitely until the user manually ends it.
+After every \`wait\` call, you MUST immediately continue with the next pattern or another \`wait\`. There is no "done" state.
+Do not summarize the session. Do not say goodbye. Do not wrap up. Just keep DJing forever.
+If you have nothing new to play, keep the current pattern and call \`wait(120)\` again.
+NEVER output a message like "That wraps up our session" or "Thanks for listening" — the show is ALWAYS on.
+
 ## Getting Started
 1. Call \`start_session\` to start the HTTP server and audio engine.
 2. The server binds to 0.0.0.0 — anyone on the LAN can tune in at the returned URL.
