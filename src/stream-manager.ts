@@ -16,8 +16,10 @@ import { Mp3StreamEncoder } from "./mp3-encoder.js";
 import { log } from "./logger.js";
 
 // Duration in seconds per render chunk.
-// Smaller chunks = lower latency but more CPU overhead.
-const CHUNK_DURATION = 0.5;
+// Larger chunks reduce per-chunk overhead (OfflineAudioContext creation,
+// superdough init) at the cost of higher latency. On a 2-vCPU VPS the
+// render barely keeps up at 0.5s — 2s gives much more headroom.
+const CHUNK_DURATION = 2.0;
 
 // ── State ────────────────────────────────────────────────────────────
 
