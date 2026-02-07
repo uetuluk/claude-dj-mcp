@@ -12,12 +12,52 @@
 import * as nodeWebAudio from "node-web-audio-api";
 import { log } from "./logger.js";
 
-// ── Polyfill Web Audio globals before importing Strudel ──────────────
+// ── Polyfill browser globals before importing Strudel ────────────────
+// Strudel's core and superdough modules reference browser APIs:
+// - signal.mjs: document.addEventListener('mousemove', ...)
+// - core/logger.mjs: document.dispatchEvent(new CustomEvent(...))
+// - dspworklet.mjs: window.addEventListener('message', ...)
+// - reverbGen.mjs: window.filterNode = filter
+// We stub these so the imports don't crash in Node.js.
+
+const g = globalThis as Record<string, unknown>;
+const noop = () => {};
+
+if (!g.document) {
+  g.document = {
+    addEventListener: noop,
+    removeEventListener: noop,
+    dispatchEvent: noop,
+    body: { clientHeight: 1, clientWidth: 1 },
+    createElement: () => ({ getContext: () => ({}) }),
+  };
+}
+
+if (!g.window) {
+  g.window = {
+    addEventListener: noop,
+    removeEventListener: noop,
+    dispatchEvent: noop,
+    postMessage: noop,
+    location: { origin: "http://localhost" },
+  };
+}
+
+if (!g.CustomEvent) {
+  g.CustomEvent = class CustomEvent extends Event {
+    detail: unknown;
+    constructor(name: string, opts?: { detail?: unknown }) {
+      super(name);
+      this.detail = opts?.detail;
+    }
+  };
+}
+
+// ── Polyfill Web Audio globals ───────────────────────────────────────
 // Superdough references many Web Audio constructors as globals
 // (BaseAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, etc.).
 // Polyfill everything node-web-audio-api exports.
 
-const g = globalThis as Record<string, unknown>;
 for (const [key, value] of Object.entries(nodeWebAudio)) {
   if (typeof value === "function") {
     g[key] = value;
@@ -26,44 +66,6 @@ for (const [key, value] of Object.entries(nodeWebAudio)) {
 
 const NodeAudioContext = nodeWebAudio.AudioContext;
 const NodeOfflineAudioContext = nodeWebAudio.OfflineAudioContext;
-
-// ── Stub superdough-specific methods missing from node-web-audio-api ─
-// Superdough's orbit bus calls createFeedbackDelay() and createReverb()
-// for .delay() and .room() effects. These don't exist in node-web-audio-api.
-// We stub them with pass-through nodes so synth notes still render (just
-// without the effect) instead of throwing and silently skipping entire notes.
-
-if (!(NodeOfflineAudioContext.prototype as any).createFeedbackDelay) {
-  (NodeOfflineAudioContext.prototype as any).createFeedbackDelay = function (
-    maxDelay: number,
-    delayTime: number,
-    feedback: number
-  ) {
-    const delay = this.createDelay(maxDelay || 1);
-    delay.delayTime.value = delayTime || 0;
-    (delay as any).feedbackGain = this.createGain();
-    (delay as any).delayGain = this.createGain();
-    (delay as any).feedback = { value: feedback || 0, setValueAtTime: () => {} };
-    (delay as any).start = () => {};
-    return delay;
-  };
-}
-
-if (!(NodeOfflineAudioContext.prototype as any).createReverb) {
-  (NodeOfflineAudioContext.prototype as any).createReverb = function () {
-    const node = this.createGain();
-    node.gain.value = 0; // Wet signal = 0, effectively no reverb
-    (node as any).generate = () => {};
-    (node as any).duration = 0;
-    (node as any).fade = 0;
-    (node as any).lp = 0;
-    (node as any).dim = 0;
-    (node as any).ir = undefined;
-    (node as any).irspeed = 1;
-    (node as any).irbegin = 0;
-    return node;
-  };
-}
 
 // ── Now import Strudel (must happen after polyfill) ──────────────────
 
